@@ -5,6 +5,8 @@ const http = require('http');
 
 const store = {}; // role -> { line, ts, seen_ip, seen_port }
 const mbox = {};  // role -> [{from, text, t}] — релей-фолбэк, когда UDP не пробит
+const logs = {};  // role -> [{seq, t, text}] — журнал клиентов, читаемо удалённо
+let logSeq = 0;
 
 // Что видно о соединении: Render ставит X-Forwarded-For (цепочка IP), порт — к сожалению,
 // только если фронт его пробрасывает. Пробуем заголовок, потом сокет.
@@ -85,6 +87,28 @@ const server = http.createServer((req, res) => {
   }
   if (p === '/lines') return send(200, { ok: true, ...store });
 
+  // журнал: POST /log/<role> телом — строки (могут быть \\n); GET /logs/<role>?since=<seq>&limit=
+  if (req.method === 'POST' && p.startsWith('/log/')) {
+    const role = p.slice(5).replace(/[^a-z]/g, '');
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 8192) req.destroy(); });
+    req.on('end', () => {
+      const arr = logs[role] = logs[role] || [];
+      for (const line of body.split('\n')) {
+        if (line.trim()) arr.push({ seq: ++logSeq, t: Date.now(), text: line.slice(0, 500) });
+      }
+      if (arr.length > 800) arr.splice(0, arr.length - 800);
+      send(200, { ok: true, n: arr.length });
+    });
+    return;
+  }
+  if (p.startsWith('/logs/')) {
+    const role = p.slice(6).replace(/[^a-z]/g, '');
+    const since = parseInt(u.searchParams.get('since') || '0', 10) || 0;
+    const limit = parseInt(u.searchParams.get('limit') || '400', 10) || 400;
+    const arr = (logs[role] || []).filter(l => l.seq > since).slice(-limit);
+    return send(200, { ok: true, lines: arr });
+  }
   send(404, { ok: false, err: 'no route' });
 });
 
