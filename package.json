@@ -1,0 +1,8 @@
+{
+  "name": "punch-tracker",
+  "version": "1.0.0",
+  "description": "Keet-style observer + live signaling for Punch P2P",
+  "main": "server.js",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node server.js" }
+}
