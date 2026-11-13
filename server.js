@@ -4,6 +4,7 @@
 const http = require('http');
 
 const store = {}; // role -> { line, ts, seen_ip, seen_port }
+const mbox = {};  // role -> [{from, text, t}] — релей-фолбэк, когда UDP не пробит
 
 // Что видно о соединении: Render ставит X-Forwarded-For (цепочка IP), порт — к сожалению,
 // только если фронт его пробрасывает. Пробуем заголовок, потом сокет.
@@ -63,6 +64,24 @@ const server = http.createServer((req, res) => {
     const s = store[role];
     if (!s) return send(404, { ok: false });
     return send(200, { ok: true, role, ...s });
+  }
+  // релей-фолбэк (keet-style): POST /msg/<role>?from=<роль> телом — текст; GET /msg/<role> — забрать и очистить
+  if (req.method === 'POST' && p.startsWith('/msg/')) {
+    const role = p.slice(5).replace(/[^a-z]/g, '');
+    let body = '';
+    req.on('data', c => { body += c; if (body.length > 8192) req.destroy(); });
+    req.on('end', () => {
+      if (!body.trim()) return send(400, { ok: false, err: 'empty' });
+      const q = mbox[role] = mbox[role] || [];
+      q.push({ from: (u.searchParams.get('from') || '').replace(/[^a-z]/g, ''), text: body.slice(0, 4000), t: Date.now() });
+      if (q.length > 100) q.splice(0, q.length - 100);
+      send(200, { ok: true, n: q.length });
+    });
+    return;
+  }
+  if (p.startsWith('/msg/')) {
+    const q = mbox[p.slice(5)] || [];
+    return send(200, { ok: true, msgs: q.splice(0, q.length) });
   }
   if (p === '/lines') return send(200, { ok: true, ...store });
 
