@@ -7,6 +7,11 @@ const store = {}; // role -> { line, ts, seen_ip, seen_port }
 const mbox = {};  // role -> [{from, text, t}] — релей-фолбэк, когда UDP не пробит
 const logs = {};  // role -> [{seq, t, text}] — журнал клиентов, читаемо удалённо
 let logSeq = 0;
+const files = {}; // role -> [{id,name,from,t,size,buf}] — HTTP-релей файлов (in-memory: free-диск эфемерный)
+let fileSeq = 0;
+const FILE_CAP = 30 * 1024 * 1024;   // один файл
+const MEM_CAP = 200 * 1024 * 1024;   // суммарно в памяти (free-инстанс: 512 MB)
+const FILES_TTL = 3600e3;            // час жизни неотобранного
 
 // Что видно о соединении: Render ставит X-Forwarded-For (цепочка IP), порт — к сожалению,
 // только если фронт его пробрасывает. Пробуем заголовок, потом сокет.
@@ -86,6 +91,46 @@ const server = http.createServer((req, res) => {
     return send(200, { ok: true, msgs: q.splice(0, q.length) });
   }
   if (p === '/lines') return send(200, { ok: true, ...store });
+
+  // ---- файлы: POST /file/<role>?from=..&name=.. телом — байты;
+  //      GET /files/<role> — список; GET /dl/<role>/<id> — скачать (удаляется после выдачи)
+  if (req.method === 'POST' && p.startsWith('/file/')) {
+    const role = p.slice(6).replace(/[^a-z]/g, '');
+    const chunks = []; let total = 0;
+    req.on('data', c => {
+      total += c.length;
+      if (total > FILE_CAP) { res.writeHead(413, { 'access-control-allow-origin': '*' }); res.end('too big'); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (res.writableEnded) return;
+      const buf = Buffer.concat(chunks);
+      if (!buf.length) return send(400, { ok: false, err: 'empty' });
+      const q = files[role] = files[role] || [];
+      const now = Date.now();
+      while (q.length && (now - q[0].t > FILES_TTL || q.reduce((s, f) => s + f.size, 0) + buf.length > MEM_CAP)) q.shift().buf = null;
+      const f = { id: ++fileSeq, name: (u.searchParams.get('name') || 'file').slice(0, 200), from: (u.searchParams.get('from') || '').replace(/[^a-z]/g, ''), t: now, size: buf.length, buf };
+      q.push(f);
+      send(200, { ok: true, id: f.id, size: f.size });
+    });
+    return;
+  }
+  if (p.startsWith('/files/')) {
+    const q = files[p.slice(7).replace(/[^a-z]/g, '')] || [];
+    return send(200, { ok: true, files: q.map(f => ({ id: f.id, name: f.name, size: f.size, from: f.from, t: f.t })) });
+  }
+  if (p.startsWith('/dl/')) {
+    const m = p.slice(4).match(/^([a-z]+)\/(\d+)$/);
+    if (!m) return send(400, { ok: false, err: 'bad dl' });
+    const q = files[m[1]] || [];
+    const i = q.findIndex(f => f.id === parseInt(m[2], 10));
+    if (i < 0) return send(404, { ok: false, err: 'gone' });
+    const f = q.splice(i, 1)[0];
+    res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': f.size,
+      'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(f.name)}`,
+      'access-control-allow-origin': '*' });
+    return res.end(f.buf);
+  }
 
   // журнал: POST /log/<role> телом — строки (могут быть \\n); GET /logs/<role>?since=<seq>&limit=
   if (req.method === 'POST' && p.startsWith('/log/')) {
